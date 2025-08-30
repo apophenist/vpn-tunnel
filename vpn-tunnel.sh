@@ -219,25 +219,33 @@ launch_spot_instance() {
     
     log "Launching spot instance ($instance_type) in $region"
     
-    # Create user data script for auto-termination
+    # Create user data script for auto-termination (runs in background to not block SSH)
     local user_data
     user_data=$(cat << 'EOF' | base64 | tr -d '\n'
 #!/bin/bash
-# Update system (Ubuntu, not CentOS)
-apt-get update -y
-apt-get install -y bc at
+# Log startup
+logger "VPN tunnel instance starting setup"
 
-# Self-termination script
-cat > /usr/local/bin/check-idle.sh << 'IDLESCRIPT'
+# Run setup in background to not block SSH
+(
+    # Wait for system to be ready
+    sleep 30
+    
+    # Update system (Ubuntu)
+    apt-get update -y >/dev/null 2>&1
+    apt-get install -y bc at >/dev/null 2>&1
+
+    # Self-termination script
+    cat > /usr/local/bin/check-idle.sh << 'IDLESCRIPT'
 #!/bin/bash
 IDLE_THRESHOLD=90
 IDLE_DURATION=1800  # 30 minutes
 
-# Get CPU idle percentage
-cpu_idle=$(top -bn1 | grep "Cpu(s)" | awk '{print $8}' | sed 's/%id,//' | sed 's/%id//')
+# Get CPU idle percentage - more robust approach
+cpu_idle=$(awk '/^cpu /{print 100-($2+$3+$4)/($2+$3+$4+$5)*100}' /proc/stat 2>/dev/null || echo 0)
+cpu_idle=${cpu_idle%.*}  # Remove decimal
 
-# Use basic comparison since bc might not be available initially
-if [[ $(echo "$cpu_idle > $IDLE_THRESHOLD" | bc -l 2>/dev/null || echo 0) -eq 1 ]]; then
+if [[ ${cpu_idle:-0} -gt $IDLE_THRESHOLD ]]; then
     # Check if idle for extended period
     if [[ -f /tmp/idle_start ]]; then
         idle_start=$(cat /tmp/idle_start)
@@ -255,16 +263,19 @@ else
 fi
 IDLESCRIPT
 
-chmod +x /usr/local/bin/check-idle.sh
+    chmod +x /usr/local/bin/check-idle.sh
 
-# Add cron job for idle checking every 5 minutes
-echo "*/5 * * * * /usr/local/bin/check-idle.sh" | crontab -
+    # Add cron job for idle checking every 5 minutes
+    echo "*/5 * * * * /usr/local/bin/check-idle.sh" | crontab -
 
-# Self-destruct after max lifetime using at command
-echo "shutdown -h now" | at now + IDLE_TIMEOUT_PLACEHOLDER minutes 2>/dev/null || true
+    # Self-destruct after max lifetime using at command
+    echo "shutdown -h now" | at now + IDLE_TIMEOUT_PLACEHOLDER minutes 2>/dev/null || true
 
-# Log startup
-logger "VPN tunnel instance started with auto-termination after IDLE_TIMEOUT_PLACEHOLDER minutes"
+    logger "VPN tunnel setup completed"
+) &
+
+# Log that setup is running in background
+logger "VPN tunnel background setup started"
 EOF
 )
     
@@ -310,16 +321,22 @@ wait_for_instance_ready() {
     
     # Wait for SSH to be available
     while [[ $waited -lt $max_wait ]]; do
-        if ssh -i "$key_file" -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
+        if ssh -i "$key_file" \
+           -o ConnectTimeout=10 \
+           -o StrictHostKeyChecking=no \
+           -o UserKnownHostsFile=/dev/null \
+           -o BatchMode=yes \
+           -o IdentitiesOnly=yes \
+           -o PasswordAuthentication=no \
            ubuntu@"$public_ip" "echo 'SSH ready'" >/dev/null 2>&1; then
             log "Instance is ready for SSH connections"
             echo "$public_ip"
             return 0
         fi
         
-        log "Waiting for SSH... ($waited/${max_wait}s)"
-        sleep 10
-        waited=$((waited + 10))
+        log "Waiting for SSH... ($waited/${max_wait}s) - Instance may still be initializing"
+        sleep 15
+        waited=$((waited + 15))
     done
     
     error "Instance failed to become ready within ${max_wait} seconds"
@@ -335,7 +352,7 @@ start_sshuttle_tunnel() {
     
     # Start sshuttle in background and capture PID
     sshuttle \
-        --ssh-cmd "ssh -i $key_file -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" \
+        --ssh-cmd "ssh -i $key_file -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o PasswordAuthentication=no" \
         -r ubuntu@"$public_ip" \
         0.0.0.0/0 \
         --pidfile="$tunnel_pid_file" \
